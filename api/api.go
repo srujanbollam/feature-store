@@ -6,24 +6,24 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"feature-store/cluster"
 	"feature-store/metrics"
 	"feature-store/ml"
-	"feature-store/store"
 )
 
 type Server struct {
-	store    *store.FeatureStore
+	node     *cluster.Node
 	router   *gin.Engine
 	metrics  *metrics.Recorder
 	pipeline *ml.Pipeline
 }
 
-func NewServer(s *store.FeatureStore) *Server {
+func NewServer(node *cluster.Node, pipeline *ml.Pipeline) *Server {
 	srv := &Server{
-		store:    s,
+		node:     node,
 		router:   gin.Default(),
 		metrics:  metrics.NewRecorder(1000),
-		pipeline: ml.NewPipeline(s),
+		pipeline: pipeline,
 	}
 	srv.router.Use(srv.latencyMiddleware())
 	srv.registerRoutes()
@@ -44,12 +44,16 @@ func (s *Server) registerRoutes() {
 	s.router.DELETE("/features/:key", s.deleteFeature)
 	s.router.GET("/metrics/latency", s.getLatencyMetrics)
 	s.router.POST("/ingest", s.ingestFeatures)
+
+	s.router.POST("/internal/replicate", s.handleReplicate)
+	s.router.GET("/health", s.handleHealth)
+	s.router.GET("/status", s.handleStatus)
 }
 
 func (s *Server) getFeature(c *gin.Context) {
 	key := c.Param("key")
 
-	value, err := s.store.Get(key)
+	value, err := s.node.Get(key)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "feature not found", "key": key})
 		return
@@ -63,6 +67,11 @@ type setFeatureRequest struct {
 }
 
 func (s *Server) setFeature(c *gin.Context) {
+	if !s.node.IsLeader {
+		c.JSON(http.StatusForbidden, gin.H{"error": "writes must go to the leader node"})
+		return
+	}
+
 	key := c.Param("key")
 
 	var req setFeatureRequest
@@ -71,7 +80,7 @@ func (s *Server) setFeature(c *gin.Context) {
 		return
 	}
 
-	if err := s.store.Set(key, req.Value); err != nil {
+	if err := s.node.Set(key, req.Value); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not store feature"})
 		return
 	}
@@ -80,9 +89,14 @@ func (s *Server) setFeature(c *gin.Context) {
 }
 
 func (s *Server) deleteFeature(c *gin.Context) {
+	if !s.node.IsLeader {
+		c.JSON(http.StatusForbidden, gin.H{"error": "deletes must go to the leader node"})
+		return
+	}
+
 	key := c.Param("key")
 
-	if err := s.store.Delete(key); err != nil {
+	if err := s.node.Delete(key); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not delete feature"})
 		return
 	}
@@ -101,8 +115,12 @@ type ingestRequest struct {
 	Clicks float64 `json:"clicks"`
 }
 
-// ingestFeatures accepts raw user data, normalizes it, and stores it.
 func (s *Server) ingestFeatures(c *gin.Context) {
+	if !s.node.IsLeader {
+		c.JSON(http.StatusForbidden, gin.H{"error": "ingestion must go to the leader node"})
+		return
+	}
+
 	var req ingestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id is required"})
@@ -122,6 +140,41 @@ func (s *Server) ingestFeatures(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"user_id": req.UserID, "ingested": true})
+}
+
+// handleReplicate is called by the leader on follower nodes to apply
+// a write that already happened on the leader.
+func (s *Server) handleReplicate(c *gin.Context) {
+	var cmd cluster.ReplicateCommand
+	if err := c.ShouldBindJSON(&cmd); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid replication command"})
+		return
+	}
+
+	if err := s.node.ApplyReplicated(cmd); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"applied": true})
+}
+
+func (s *Server) handleHealth(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "node": s.node.ID})
+}
+
+func (s *Server) handleStatus(c *gin.Context) {
+	role := "follower"
+	if s.node.IsLeader {
+		role = "leader"
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"node":    s.node.ID,
+		"role":    role,
+		"address": s.node.Address,
+		"peers":   s.node.Peers,
+	})
 }
 
 func (s *Server) Start(port string) error {
