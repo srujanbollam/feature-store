@@ -7,31 +7,33 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"feature-store/metrics"
+	"feature-store/ml"
 	"feature-store/store"
 )
 
 type Server struct {
-	store   *store.FeatureStore
-	router  *gin.Engine
-	metrics *metrics.Recorder
+	store    *store.FeatureStore
+	router   *gin.Engine
+	metrics  *metrics.Recorder
+	pipeline *ml.Pipeline
 }
 
 func NewServer(s *store.FeatureStore) *Server {
 	srv := &Server{
-		store:   s,
-		router:  gin.Default(),
-		metrics: metrics.NewRecorder(1000),
+		store:    s,
+		router:   gin.Default(),
+		metrics:  metrics.NewRecorder(1000),
+		pipeline: ml.NewPipeline(s),
 	}
 	srv.router.Use(srv.latencyMiddleware())
 	srv.registerRoutes()
 	return srv
 }
 
-// latencyMiddleware records how long each request took.
 func (s *Server) latencyMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
-		c.Next() // run the actual handler
+		c.Next()
 		s.metrics.Record(time.Since(start))
 	}
 }
@@ -41,6 +43,7 @@ func (s *Server) registerRoutes() {
 	s.router.PUT("/features/:key", s.setFeature)
 	s.router.DELETE("/features/:key", s.deleteFeature)
 	s.router.GET("/metrics/latency", s.getLatencyMetrics)
+	s.router.POST("/ingest", s.ingestFeatures)
 }
 
 func (s *Server) getFeature(c *gin.Context) {
@@ -87,9 +90,38 @@ func (s *Server) deleteFeature(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"key": key, "deleted": true})
 }
 
-// getLatencyMetrics exposes current P50/P95/P99/P100 latency stats.
 func (s *Server) getLatencyMetrics(c *gin.Context) {
 	c.JSON(http.StatusOK, s.metrics.Snapshot())
+}
+
+type ingestRequest struct {
+	UserID string  `json:"user_id" binding:"required"`
+	Age    float64 `json:"age"`
+	Income float64 `json:"income"`
+	Clicks float64 `json:"clicks"`
+}
+
+// ingestFeatures accepts raw user data, normalizes it, and stores it.
+func (s *Server) ingestFeatures(c *gin.Context) {
+	var req ingestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id is required"})
+		return
+	}
+
+	raw := ml.RawFeatures{
+		UserID: req.UserID,
+		Age:    req.Age,
+		Income: req.Income,
+		Clicks: req.Clicks,
+	}
+
+	if err := s.pipeline.Ingest(raw); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "ingestion failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"user_id": req.UserID, "ingested": true})
 }
 
 func (s *Server) Start(port string) error {
