@@ -28,7 +28,8 @@ func main() {
 	}
 	defer fs.Close()
 
-	node := cluster.NewNode(nodeID, "localhost:"+port, isLeader, peers, fs)
+	pendingLogPath := fmt.Sprintf("/app/data/%s-pending.log", nodeID)
+	node := cluster.NewNode(nodeID, "localhost:"+port, isLeader, peers, fs, pendingLogPath)
 	pipeline := ml.NewPipeline(fs)
 
 	server := api.NewServer(node, pipeline)

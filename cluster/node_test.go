@@ -42,7 +42,7 @@ func TestReplicateSucceedsOnFirstAttempt(t *testing.T) {
 	defer server.Close()
 
 	peerAddr := server.Listener.Addr().String()
-	node := NewNode("leader", "localhost:9000", true, []string{peerAddr}, newFakeStore())
+	node := NewNode("leader", "localhost:9000", true, []string{peerAddr}, newFakeStore(),"")
 
 	if err := node.Set("key1", "value1"); err != nil {
 		t.Fatalf("Set returned error: %v", err)
@@ -65,7 +65,7 @@ func TestReplicateQueuesAfterAllRetriesFail(t *testing.T) {
 	// An address nothing is listening on — every request will fail.
 	unreachablePeer := "127.0.0.1:1"
 
-	node := NewNode("leader", "localhost:9000", true, []string{unreachablePeer}, newFakeStore())
+	node := NewNode("leader", "localhost:9000", true, []string{unreachablePeer}, newFakeStore(),"")
 
 	if err := node.Set("key1", "value1"); err != nil {
 		t.Fatalf("Set returned error: %v", err)
@@ -90,7 +90,7 @@ func TestReplayPendingClearsQueueOnSuccess(t *testing.T) {
 	defer server.Close()
 
 	peerAddr := server.Listener.Addr().String()
-	node := NewNode("leader", "localhost:9000", true, []string{peerAddr}, newFakeStore())
+	node := NewNode("leader", "localhost:9000", true, []string{peerAddr}, newFakeStore(),"")
 
 	// Manually queue a pending command, simulating a previously failed replication.
 	node.pendingMu.Lock()
@@ -106,5 +106,30 @@ func TestReplayPendingClearsQueueOnSuccess(t *testing.T) {
 
 	if atomic.LoadInt32(&requestCount) != 1 {
 		t.Errorf("expected exactly 1 replay request, got %d", requestCount)
+	}
+}
+
+
+func TestPendingQueueSurvivesRestart(t *testing.T) {
+	logPath := t.TempDir() + "/pending.log"
+	unreachablePeer := "127.0.0.1:1"
+
+	// First "run": queue a write that fails to replicate.
+	node1 := NewNode("leader", "localhost:9000", true, []string{unreachablePeer}, newFakeStore(), logPath)
+	if err := node1.Set("key1", "value1"); err != nil {
+		t.Fatalf("Set returned error: %v", err)
+	}
+	time.Sleep(1 * time.Second) // wait for retries to exhaust
+
+	if node1.PendingCount(unreachablePeer) != 1 {
+		t.Fatalf("expected 1 pending command before restart, got %d", node1.PendingCount(unreachablePeer))
+	}
+
+	// Simulate a restart: construct a brand new Node pointed at the same log file.
+	node2 := NewNode("leader", "localhost:9000", true, []string{unreachablePeer}, newFakeStore(), logPath)
+
+	if node2.PendingCount(unreachablePeer) != 1 {
+		t.Errorf("expected pending command to be restored after restart, got %d",
+			node2.PendingCount(unreachablePeer))
 	}
 }

@@ -1,10 +1,12 @@
 package cluster
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -36,11 +38,18 @@ type Node struct {
 	// silently staying stale.
 	pendingMu sync.Mutex
 	pending   map[string][]ReplicateCommand // peer address -> missed commands
+
+	// pendingLogPath is the file each queued command is appended to,
+	// so the queue survives a leader restart. Empty disables persistence.
+	pendingLogPath string
+	logMu          sync.Mutex
 }
 
-// NewNode creates a Node backed by the given store.
-func NewNode(id, address string, isLeader bool, peers []string, s FeatureStore) *Node {
-	return &Node{
+// NewNode creates a Node backed by the given store. pendingLogPath, if
+// non-empty, is used to persist queued replication commands to disk
+// and to restore them on startup.
+func NewNode(id, address string, isLeader bool, peers []string, s FeatureStore, pendingLogPath string) *Node {
+	n := &Node{
 		ID:       id,
 		Address:  address,
 		IsLeader: isLeader,
@@ -49,8 +58,15 @@ func NewNode(id, address string, isLeader bool, peers []string, s FeatureStore) 
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 		},
-		pending: make(map[string][]ReplicateCommand),
+		pending:        make(map[string][]ReplicateCommand),
+		pendingLogPath: pendingLogPath,
 	}
+
+	if pendingLogPath != "" {
+		n.loadPendingFromDisk()
+	}
+
+	return n
 }
 
 // ReplicateCommand is the payload sent from leader to followers to
@@ -59,6 +75,13 @@ type ReplicateCommand struct {
 	Action string `json:"action"` // "set" or "delete"
 	Key    string `json:"key"`
 	Value  string `json:"value,omitempty"`
+}
+
+// pendingLogEntry is one line of the persisted pending log: which peer
+// the command was destined for, plus the command itself.
+type pendingLogEntry struct {
+	Peer    string           `json:"peer"`
+	Command ReplicateCommand `json:"command"`
 }
 
 // Set writes a key locally and, if this node is the leader, replicates
@@ -133,9 +156,7 @@ func (n *Node) replicateToPeerWithRetry(peer string, cmd ReplicateCommand) {
 	fmt.Printf("replication to %s failed after %d attempts, queued for catch-up: %s %s\n",
 		peer, maxReplicationAttempts, cmd.Action, cmd.Key)
 
-	n.pendingMu.Lock()
-	n.pending[peer] = append(n.pending[peer], cmd)
-	n.pendingMu.Unlock()
+	n.queuePending(peer, cmd)
 }
 
 func (n *Node) sendReplicateRequest(peer string, cmd ReplicateCommand) bool {
@@ -186,10 +207,119 @@ func (n *Node) ReplayPending(peer string) {
 
 	for _, cmd := range commands {
 		if !n.sendReplicateRequest(peer, cmd) {
-			// Still unreachable — put it back in the queue.
-			n.pendingMu.Lock()
-			n.pending[peer] = append(n.pending[peer], cmd)
-			n.pendingMu.Unlock()
+			n.queuePending(peer, cmd)
+			continue
 		}
+		n.removeFromDiskLog(peer, cmd)
+	}
+}
+
+// queuePending adds a command to the in-memory queue and appends it
+// to the on-disk log so it survives a restart.
+func (n *Node) queuePending(peer string, cmd ReplicateCommand) {
+	n.pendingMu.Lock()
+	n.pending[peer] = append(n.pending[peer], cmd)
+	n.pendingMu.Unlock()
+
+	n.appendToDiskLog(peer, cmd)
+}
+
+// appendToDiskLog writes one pending entry as a JSON line. Using
+// append-only writes keeps this cheap and crash-safe — we never
+// rewrite the whole file when queuing a new entry.
+func (n *Node) appendToDiskLog(peer string, cmd ReplicateCommand) {
+	if n.pendingLogPath == "" {
+		return
+	}
+
+	n.logMu.Lock()
+	defer n.logMu.Unlock()
+
+	f, err := os.OpenFile(n.pendingLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("warning: could not persist pending replication entry: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	entry := pendingLogEntry{Peer: peer, Command: cmd}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+
+	f.Write(line)
+	f.Write([]byte("\n"))
+}
+
+// removeFromDiskLog rewrites the log file without the given entry,
+// called after a queued command successfully replays. The log is
+// expected to stay small (only entries from genuine outages
+// accumulate), so a full rewrite on each removal is an acceptable
+// tradeoff for simplicity here.
+func (n *Node) removeFromDiskLog(peer string, target ReplicateCommand) {
+	if n.pendingLogPath == "" {
+		return
+	}
+
+	n.logMu.Lock()
+	defer n.logMu.Unlock()
+
+	f, err := os.Open(n.pendingLogPath)
+	if err != nil {
+		return
+	}
+
+	var remaining []pendingLogEntry
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var entry pendingLogEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		if entry.Peer == peer && entry.Command == target {
+			continue // drop this one — it succeeded
+		}
+		remaining = append(remaining, entry)
+	}
+	f.Close()
+
+	out, err := os.Create(n.pendingLogPath)
+	if err != nil {
+		return
+	}
+	defer out.Close()
+
+	for _, entry := range remaining {
+		line, _ := json.Marshal(entry)
+		out.Write(line)
+		out.Write([]byte("\n"))
+	}
+}
+
+// loadPendingFromDisk reads any pending entries left over from a
+// previous run and rebuilds the in-memory queue, so a restarted
+// leader resumes trying to deliver writes it hadn't finished
+// replicating before it stopped.
+func (n *Node) loadPendingFromDisk() {
+	f, err := os.Open(n.pendingLogPath)
+	if err != nil {
+		return // no log yet — nothing to restore
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	count := 0
+	for scanner.Scan() {
+		var entry pendingLogEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		n.pending[entry.Peer] = append(n.pending[entry.Peer], entry.Command)
+		count++
+	}
+
+	if count > 0 {
+		fmt.Printf("restored %d pending replication entries from disk\n", count)
 	}
 }
