@@ -1,0 +1,4 @@
+*.db
+.git
+.gitignore
+README.md

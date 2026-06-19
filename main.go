@@ -18,7 +18,7 @@ func main() {
 	isLeader := getEnv("LEADER", "false") == "true"
 	peers := parsePeers(getEnv("PEERS", ""))
 
-	dbPath := fmt.Sprintf("%s.db", nodeID)
+	dbPath := fmt.Sprintf("/app/data/%s.db", nodeID)
 
 	log.Printf("starting %s (leader=%v) on :%s", nodeID, isLeader, port)
 
