@@ -25,6 +25,7 @@ func NewServer(node *cluster.Node, pipeline *ml.Pipeline) *Server {
 		metrics:  metrics.NewRecorder(1000),
 		pipeline: pipeline,
 	}
+	srv.router.Use(srv.corsMiddleware())
 	srv.router.Use(srv.latencyMiddleware())
 	srv.registerRoutes()
 	return srv
@@ -39,6 +40,10 @@ func (s *Server) latencyMiddleware() gin.HandlerFunc {
 }
 
 func (s *Server) registerRoutes() {
+
+	s.router.GET("/", s.handleDashboard)
+
+
 	s.router.GET("/features/:key", s.getFeature)
 	s.router.PUT("/features/:key", s.setFeature)
 	s.router.DELETE("/features/:key", s.deleteFeature)
@@ -179,4 +184,24 @@ func (s *Server) handleStatus(c *gin.Context) {
 
 func (s *Server) Start(port string) error {
 	return s.router.Run(":" + port)
+}
+
+
+
+// corsMiddleware allows the dashboard (served from one node) to query
+// the other nodes in the cluster, which run on different ports and
+// are therefore treated as different origins by the browser.
+func (s *Server) corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+
+		c.Next()
+	}
 }
