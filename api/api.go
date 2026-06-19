@@ -3,7 +3,7 @@ package api
 import (
 	"net/http"
 	"time"
-
+	"fmt"
 	"github.com/gin-gonic/gin"
 
 	"feature-store/cluster"
@@ -28,6 +28,7 @@ func NewServer(node *cluster.Node, pipeline *ml.Pipeline) *Server {
 	srv.router.Use(srv.corsMiddleware())
 	srv.router.Use(srv.latencyMiddleware())
 	srv.registerRoutes()
+	srv.startPeerWatcher()
 	return srv
 }
 
@@ -204,4 +205,41 @@ func (s *Server) corsMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+
+// startPeerWatcher periodically checks each peer's health and replays
+// any pending (previously failed) replication commands once a peer
+// becomes reachable again. Only meaningful on the leader, since only
+// the leader accumulates pending writes.
+func (s *Server) startPeerWatcher() {
+	if !s.node.IsLeader {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			for _, peer := range s.node.Peers {
+				if s.node.PendingCount(peer) == 0 {
+					continue
+				}
+				if isPeerHealthy(peer) {
+					s.node.ReplayPending(peer)
+				}
+			}
+		}
+	}()
+}
+
+func isPeerHealthy(peer string) bool {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s/health", peer))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
