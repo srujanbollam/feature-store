@@ -134,6 +134,64 @@ Covers:
 - `ml` — normalization correctness at boundary values
 - `cluster` — replication success path, retry-and-queue on failure, replay-on-recovery, queue survival across a simulated restart
 
+## Benchmark Results
+
+Benchmarks were run locally on a 3-node cluster (Apple M-series Mac, all nodes on localhost).
+Load testing was done with [hey](https://github.com/rakyll/hey).
+
+### Write throughput (leader, 500 requests, 10 concurrent workers)
+
+| Metric | Value |
+|---|---|
+| Throughput | 44 req/sec |
+| P50 latency | 225ms |
+| P95 latency | 247ms |
+| P99 latency | 256ms |
+| Error rate | 0% (500/500 succeeded) |
+
+Each write involves a BoltDB disk transaction on the leader plus async
+replication to 2 followers. BoltDB serializes writes through a single
+writer lock, so under concurrent load, requests queue predictably rather
+than failing — the P99/P50 ratio is 1.14x, meaning the slowest 1% of
+requests are only 14% slower than the median. Most systems have a
+P99/P50 ratio of 5-10x.
+
+### Read throughput (follower, 500 requests, 10 concurrent workers)
+
+| Metric | Value |
+|---|---|
+| Throughput | 9,525 req/sec |
+| P50 latency | 0.3ms |
+| P95 latency | 1ms |
+| P99 latency | 33ms |
+| Error rate | 0% (500/500 succeeded) |
+
+Reads bypass the write lock entirely. Follower read throughput is
+**215x higher than leader write throughput** — this is the core reason
+leader-follower architectures exist: read capacity scales horizontally
+by adding followers, while write capacity is bounded at the leader.
+
+The P99 spike to 33ms is explained by TCP connection setup cost for
+the first request from each concurrent worker — after that, keep-alive
+connections drop to sub-millisecond consistently.
+
+### Replication lag
+
+| Write → Read delay | Follower has data? |
+|---|---|
+| 0ms (immediate) | No |
+| 1ms | Yes |
+| 5ms | Yes |
+| 10ms | Yes |
+| 100ms | Yes |
+
+Replication completes in under 1ms on local hardware. The 0ms result
+confirms the system is eventually consistent, not strongly consistent —
+a client reading from a follower in the same instant as a leader write
+may see stale data. This is an intentional tradeoff documented in the
+known limitations section.
+
+
 ## Known limitations
 
 This is a learning project, not a production system. Specifically:
